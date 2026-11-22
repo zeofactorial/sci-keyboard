@@ -36,10 +36,26 @@ class SciKeyboardService : InputMethodService() {
     private var script = Script.NONE
     private var category = 0
 
+    // শব্দ সাজেশন
+    private var learning = true
+    private var suggestions: List<String> = emptyList()
+    private var strip: LinearLayout? = null
+    private lateinit var store: WordStore
+
     private lateinit var root: LinearLayout
     private val handler = Handler(Looper.getMainLooper())
 
     // ---------------------------------------------------------------- lifecycle
+
+    override fun onCreate() {
+        super.onCreate()
+        store = WordStore(this)
+    }
+
+    override fun onDestroy() {
+        store.save()
+        super.onDestroy()
+    }
 
     override fun onCreateInputView(): View {
         root = LinearLayout(this).apply {
@@ -53,7 +69,10 @@ class SciKeyboardService : InputMethodService() {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        learning = shouldLearn(info?.inputType ?: 0)
+        suggestions = emptyList()
         if (!restarting) {
+            store.reload()
             shift = false
             caps = false
             script = Script.NONE
@@ -70,27 +89,44 @@ class SciKeyboardService : InputMethodService() {
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
         handler.removeCallbacksAndMessages(null)
+        store.save()
+    }
+
+    override fun onUpdateSelection(
+        oldSelStart: Int, oldSelEnd: Int,
+        newSelStart: Int, newSelEnd: Int,
+        candidatesStart: Int, candidatesEnd: Int
+    ) {
+        super.onUpdateSelection(
+            oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd
+        )
+        if (::root.isInitialized) updateSuggestions()
     }
 
     // ---------------------------------------------------------------- rendering
 
     private fun go(p: Page) {
         page = p
+        suggestions = emptyList()
         render()
+        updateSuggestions()
     }
 
     private fun render() {
         root.removeAllViews()
         when (page) {
             Page.LETTERS -> {
-                root.addView(quickStrip())
+                root.addView(newStrip())
                 buildLetters()
             }
             Page.NUMBERS -> {
-                root.addView(quickStrip())
+                root.addView(newStrip())
                 buildNumbers()
             }
-            Page.SYMBOLS -> buildSymbols()
+            Page.SYMBOLS -> {
+                strip = null
+                buildSymbols()
+            }
         }
     }
 
@@ -176,7 +212,7 @@ class SciKeyboardService : InputMethodService() {
         SymbolData.categories[category].items.chunked(COLS).forEach { chunk ->
             val cells = ArrayList<View>()
             chunk.forEach { sym ->
-                cells.add(key(sym.label, textSp = 20f) { commit(sym.insert) })
+                cells.add(key(sym.label, textSp = 20f) { commitSymbol(sym.insert) })
             }
             repeat(COLS - chunk.size) { cells.add(spacer(1f)) }
             grid.addView(rowOf(cells))
@@ -215,7 +251,7 @@ class SciKeyboardService : InputMethodService() {
         }
         addKey(key("x²", color = if (script == Script.SUP) C_ACCENT else C_FUNC) { toggleScript(Script.SUP) })
         addKey(key("x₂", color = if (script == Script.SUB) C_ACCENT else C_FUNC) { toggleScript(Script.SUB) })
-        QUICK.forEach { s -> addKey(key(s) { commit(s) }) }
+        QUICK.forEach { s -> addKey(key(s) { commitSymbol(s) }) }
 
         return HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -351,6 +387,117 @@ class SciKeyboardService : InputMethodService() {
     private fun toggleScript(s: Script) {
         script = if (script == s) Script.NONE else s
         render()
+        updateSuggestions()
+    }
+
+    // ---------------------------------------------------------------- word suggestions
+
+    /** পাসওয়ার্ড, ইমেইল, URL বা "no suggestions" ঘরে শেখা/সাজেশন বন্ধ থাকে। */
+    private fun shouldLearn(type: Int): Boolean {
+        val cls = type and InputType.TYPE_MASK_CLASS
+        val variation = type and InputType.TYPE_MASK_VARIATION
+        if (cls == InputType.TYPE_CLASS_TEXT) {
+            if (variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+                variation == InputType.TYPE_TEXT_VARIATION_URI
+            ) return false
+            if ((type and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0) return false
+        }
+        if (cls == InputType.TYPE_CLASS_NUMBER &&
+            variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        ) return false
+        return true
+    }
+
+    /** কার্সরের ঠিক আগের (অসম্পূর্ণ) শব্দ। */
+    private fun currentPrefix(): String {
+        val before = currentInputConnection?.getTextBeforeCursor(32, 0) ?: return ""
+        var i = before.length
+        while (i > 0 && before[i - 1].isLetter()) i--
+        return before.substring(i)
+    }
+
+    private fun learnCurrent() {
+        if (!learning || script != Script.NONE) return
+        val w = currentPrefix()
+        if (w.length >= 2) store.learn(w)
+    }
+
+    private fun capLike(word: String, prefix: String): String = when {
+        prefix.length > 1 && prefix.all { it.isUpperCase() } -> word.uppercase()
+        prefix.isNotEmpty() && prefix[0].isUpperCase() ->
+            word.replaceFirstChar { it.uppercaseChar() }
+        else -> word
+    }
+
+    private fun updateSuggestions() {
+        val next: List<String> =
+            if (!learning || script != Script.NONE || page != Page.LETTERS) {
+                emptyList()
+            } else {
+                val p = currentPrefix()
+                if (p.isEmpty()) emptyList() else store.suggest(p, 3).map { capLike(it, p) }
+            }
+        if (next != suggestions) {
+            suggestions = next
+            fillStrip()
+        }
+    }
+
+    private fun newStrip(): View {
+        val holder = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(STRIP_H)
+            )
+        }
+        strip = holder
+        fillStrip()
+        return holder
+    }
+
+    private fun fillStrip() {
+        val holder = strip ?: return
+        holder.removeAllViews()
+        holder.addView(
+            if (page == Page.LETTERS && suggestions.isNotEmpty()) suggestionStrip() else quickStrip()
+        )
+    }
+
+    private fun suggestionStrip(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(STRIP_H)
+            )
+        }
+        suggestions.forEach { w ->
+            row.addView(key(w, color = C_FUNC, textSp = 17f) { acceptSuggestion(w) })
+        }
+        repeat(3 - suggestions.size) { row.addView(spacer(1f)) }
+        return row
+    }
+
+    private fun acceptSuggestion(word: String) {
+        val ic = currentInputConnection ?: return
+        val prefix = currentPrefix()
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(prefix.length, 0)
+        ic.commitText("$word ", 1)
+        ic.endBatchEdit()
+        if (learning) store.learn(word)
+        updateSuggestions()
+    }
+
+    /** চিহ্ন বসানোর আগে চলতি শব্দটা শিখে নেয়। */
+    private fun commitSymbol(s: String) {
+        learnCurrent()
+        commit(s)
+        updateSuggestions()
     }
 
     /** অক্ষর/সংখ্যা টাইপ; x²/x₂ মোড চালু থাকলে সুপার/সাবস্ক্রিপ্টে রূপান্তর করে। */
@@ -360,7 +507,9 @@ class SciKeyboardService : InputMethodService() {
             Script.SUB -> s.map { (SUB[it] ?: it).toString() }.joinToString("")
             Script.NONE -> s
         }
+        if (out.isNotEmpty() && !out[0].isLetter()) learnCurrent()
         commit(out)
+        updateSuggestions()
         if (shift && !caps) {
             shift = false
             render()
@@ -368,10 +517,13 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun pressSpace() {
+        learnCurrent()
         commit(" ")
+        updateSuggestions()
     }
 
     private fun pressEnter() {
+        learnCurrent()
         val ic = currentInputConnection ?: return
         val ei = currentInputEditorInfo
         val action = (ei?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
@@ -384,9 +536,15 @@ class SciKeyboardService : InputMethodService() {
         } else {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
         }
+        updateSuggestions()
     }
 
     private fun backspace() {
+        doBackspace()
+        updateSuggestions()
+    }
+
+    private fun doBackspace() {
         val ic = currentInputConnection ?: return
         val selected = ic.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {

@@ -13,6 +13,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 /** সেটআপ স্ক্রিন: কীবোর্ড চালু করা, বেছে নেওয়া এবং টেস্ট করার জায়গা। */
 class MainActivity : Activity() {
@@ -76,11 +77,18 @@ class MainActivity : Activity() {
             ).apply { bottomMargin = dp(20) }
         )
 
+        text("শব্দের সাজেশন", 16f, bold = true, bottom = 4)
+        button("শেখা শব্দ মুছে ফেলুন") {
+            WordStore(this).clear()
+            Toast.makeText(this, "শেখা শব্দ মুছে ফেলা হয়েছে", Toast.LENGTH_SHORT).show()
+        }
+
         text("কীভাবে ব্যবহার করবেন", 16f, bold = true, bottom = 4)
         text(
             "• ∑π বাটন → সব গাণিতিক চিহ্নের পেজ (Greek, Relations, Calculus, Arrows, Accents…)\n" +
                 "• উপরের স্ট্রিপে x² / x₂ চাপলে পরের টাইপ করা অক্ষর/সংখ্যা সুপারস্ক্রিপ্ট/সাবস্ক্রিপ্ট হবে\n" +
                 "• যেকোনো চিহ্নের বাটন চাপলেই সেটা সরাসরি টাইপ হবে, অন্য অক্ষরের মতো\n" +
+                "• টাইপ করার সময় উপরে আগে লেখা শব্দ থেকে সাজেশন আসে, চাপলেই শব্দ বসে যায়\n" +
                 "• ⇧ দুইবার চাপলে Caps Lock\n" +
                 "• ⌫ চেপে ধরলে ক্রমাগত মুছবে",
             14f
