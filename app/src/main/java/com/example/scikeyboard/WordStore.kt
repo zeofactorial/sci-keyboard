@@ -88,6 +88,74 @@ class WordStore(context: Context) {
 
     private fun score(w: String): Int = (seed[w] ?: 0) + (counts[w] ?: 0) * 10
 
+    /** সব পরিচিত শব্দ (সোয়াইপ টাইপিংয়ের জন্য)। */
+    fun allWords(): Collection<String> {
+        val all = HashSet<String>(seed.size + counts.size)
+        all.addAll(seed.keys)
+        all.addAll(counts.keys)
+        return all
+    }
+
+    fun scoreOf(w: String): Int = score(w)
+
+    /** শব্দটা কি ডিকশনারিতে (বা বারবার টাইপ করা) আছে? */
+    fun isKnown(w: String): Boolean {
+        val l = w.lowercase()
+        return seed.containsKey(l) || (counts[l] ?: 0) >= 2
+    }
+
+    /**
+     * ভুল বানানের জন্য সবচেয়ে সম্ভাব্য সঠিক শব্দ (১টা অক্ষর ভুল/বাদ/বাড়তি/উল্টো হলে)।
+     * নিশ্চিত না হলে null।
+     */
+    fun correct(word: String): String? {
+        val w = word.lowercase()
+        if (w.length < 3 || isKnown(w)) return null
+        var best: String? = null
+        var bestScore = -1
+        var bestSameLen = false
+        fun consider(c: String) {
+            if (c == w || kotlin.math.abs(c.length - w.length) > 1) return
+            if (c[0] != w[0]) return
+            if (!withinOneEdit(w, c)) return
+            val sc = score(c)
+            if (sc < 20 && (seed[c] ?: 0) < 3) return
+            val same = c.length == w.length
+            if (best == null || (same && !bestSameLen) || (same == bestSameLen && sc > bestScore)) {
+                best = c
+                bestScore = sc
+                bestSameLen = same
+            }
+        }
+        for (c in seed.keys) consider(c)
+        for (c in counts.keys) consider(c)
+        return best
+    }
+
+    /** a আর b-র মধ্যে ১টার বেশি সম্পাদনা (বদল/বাদ/যোগ/পাশাপাশি উল্টো) লাগে কি না। */
+    private fun withinOneEdit(a: String, b: String): Boolean {
+        if (a == b) return true
+        val la = a.length
+        val lb = b.length
+        if (kotlin.math.abs(la - lb) > 1) return false
+        if (la == lb) {
+            var i = 0
+            while (i < la && a[i] == b[i]) i++
+            if (i == la) return true
+            // একটা অক্ষর বদল
+            if (a.substring(i + 1) == b.substring(i + 1)) return true
+            // পাশাপাশি দুটো অক্ষর উল্টো
+            if (i + 1 < la && a[i] == b[i + 1] && a[i + 1] == b[i] &&
+                a.substring(i + 2) == b.substring(i + 2)
+            ) return true
+            return false
+        }
+        val (s, l) = if (la < lb) Pair(a, b) else Pair(b, a)
+        var i = 0
+        while (i < s.length && s[i] == l[i]) i++
+        return s.substring(i) == l.substring(i + 1)
+    }
+
     /** [prefix] দিয়ে শুরু হওয়া সবচেয়ে সম্ভাব্য শব্দ। */
     fun suggest(prefix: String, limit: Int): List<String> {
         val p = prefix.lowercase()

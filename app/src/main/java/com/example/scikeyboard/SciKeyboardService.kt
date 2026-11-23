@@ -1,6 +1,7 @@
 package com.example.scikeyboard
 
 import android.Manifest
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -11,6 +12,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -19,6 +21,8 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.inputmethodservice.InputMethodService
+import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -39,10 +43,18 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.FileProvider
+import androidx.core.view.inputmethod.EditorInfoCompat
+import androidx.core.view.inputmethod.InputConnectionCompat
+import androidx.core.view.inputmethod.InputContentInfoCompat
+import java.io.File
+import kotlin.math.abs
+import kotlin.math.hypot
 
 /** ছবির থিমের জন্য: ছবিটা কীবোর্ডের পেছনে center-crop করে আঁকে (আকার বদলায় না)। */
 private class CropDrawable(private val bmp: Bitmap, private val scrim: Int) : Drawable() {
@@ -75,13 +87,198 @@ private class CropDrawable(private val bmp: Bitmap, private val scrim: Int) : Dr
     override fun getOpacity(): Int = PixelFormat.OPAQUE
 }
 
+
+/**
+ * অক্ষরের সারিগুলোর কনটেইনার: আঙুল টেনে (swipe) শব্দ লেখার জন্য।
+ * ছোট টাচ হলে আগের মতোই কী চাপা হয়; আঙুল বেশি সরলে swipe শুরু হয়।
+ * কী-এর tag-এ অক্ষর (Char) থাকলে সেটাই swipe-এর কী।
+ */
+private class SwipeLayout(
+    ctx: Context,
+    private val enabled: () -> Boolean,
+    private val slopPx: Int,
+    private val trailPx: Float,
+    private val trailColor: Int,
+    private val onSwipe: (List<Char>, List<Char>) -> Unit
+) : LinearLayout(ctx) {
+
+    private val pts = ArrayList<FloatArray>()
+    private var swiping = false
+    private var eligible = false
+    private var startX = 0f
+    private var startY = 0f
+    private val path = Path()
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    init {
+        orientation = LinearLayout.VERTICAL
+        setWillNotDraw(false)
+        paint.style = Paint.Style.STROKE
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeJoin = Paint.Join.ROUND
+        paint.strokeWidth = trailPx
+        paint.color = trailColor
+    }
+
+    override fun dispatchDraw(canvas: Canvas) {
+        super.dispatchDraw(canvas)
+        if (swiping && pts.size > 1) {
+            path.reset()
+            path.moveTo(pts[0][0], pts[0][1])
+            for (i in 1 until pts.size) path.lineTo(pts[i][0], pts[i][1])
+            canvas.drawPath(path, paint)
+        }
+    }
+
+    /** (x, y) বিন্দুর সবচেয়ে কাছের অক্ষর-কী। */
+    private fun keyAt(x: Float, y: Float): Char? {
+        if (childCount == 0) return null
+        val top = getChildAt(0).top.toFloat()
+        val bottom = getChildAt(childCount - 1).bottom.toFloat() - 1f
+        val yy = y.coerceIn(top, bottom)
+        for (r in 0 until childCount) {
+            val row = getChildAt(r) as? ViewGroup ?: continue
+            if (yy < row.top || yy > row.bottom) continue
+            var best: Char? = null
+            var bestD = Float.MAX_VALUE
+            for (k in 0 until row.childCount) {
+                val key = row.getChildAt(k)
+                val c = key.tag as? Char ?: continue
+                val cx = row.left + (key.left + key.right) / 2f
+                val d = abs(x - cx)
+                if (d < bestD) {
+                    bestD = d
+                    best = c
+                }
+            }
+            return best
+        }
+        return null
+    }
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                startX = ev.x
+                startY = ev.y
+                swiping = false
+                pts.clear()
+                eligible = enabled() && keyAt(ev.x, ev.y) != null
+                if (eligible) pts.add(floatArrayOf(ev.x, ev.y))
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (eligible && !swiping) {
+                    pts.add(floatArrayOf(ev.x, ev.y))
+                    if (hypot(ev.x - startX, ev.y - startY) > slopPx) {
+                        swiping = true
+                        return true
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> reset()
+        }
+        return false
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> return eligible
+            MotionEvent.ACTION_MOVE -> {
+                if (!eligible) return false
+                pts.add(floatArrayOf(ev.x, ev.y))
+                if (!swiping && hypot(ev.x - startX, ev.y - startY) > slopPx) swiping = true
+                if (swiping) invalidate()
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (swiping) {
+                    pts.add(floatArrayOf(ev.x, ev.y))
+                    finishSwipe()
+                }
+                reset()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                reset()
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun reset() {
+        val wasSwiping = swiping
+        swiping = false
+        eligible = false
+        pts.clear()
+        if (wasSwiping) invalidate()
+    }
+
+    private fun finishSwipe() {
+        if (pts.size < 2) return
+        val step = maxOf(slopPx / 2f, 6f)
+
+        // পথটাকে সমান দূরত্বের বিন্দুতে ভাগ করে প্রতিটার কী বের করি
+        val keys = ArrayList<Char>()
+        fun addKey(x: Float, y: Float) {
+            val c = keyAt(x, y) ?: return
+            if (keys.isEmpty() || keys[keys.size - 1] != c) keys.add(c)
+        }
+        addKey(pts[0][0], pts[0][1])
+        for (i in 1 until pts.size) {
+            val a = pts[i - 1]
+            val b = pts[i]
+            val d = hypot(b[0] - a[0], b[1] - a[1])
+            val n = (d / step).toInt()
+            for (j in 1..n) {
+                val t = j * step / d
+                addKey(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            }
+            addKey(b[0], b[1])
+        }
+
+        // মোড় নেওয়া বিন্দুগুলো (এই অক্ষরগুলো শব্দে অবশ্যই থাকবে)
+        val spacing = slopPx * 1.4f
+        val kept = ArrayList<FloatArray>()
+        kept.add(pts[0])
+        for (i in 1 until pts.size) {
+            val last = kept[kept.size - 1]
+            if (hypot(pts[i][0] - last[0], pts[i][1] - last[1]) >= spacing) kept.add(pts[i])
+        }
+        val end = pts[pts.size - 1]
+        val lastKept = kept[kept.size - 1]
+        if (lastKept[0] != end[0] || lastKept[1] != end[1]) kept.add(end)
+
+        val corners = ArrayList<Char>()
+        fun addCorner(x: Float, y: Float) {
+            val c = keyAt(x, y) ?: return
+            if (corners.isEmpty() || corners[corners.size - 1] != c) corners.add(c)
+        }
+        addCorner(kept[0][0], kept[0][1])
+        for (i in 1 until kept.size - 1) {
+            val v1x = kept[i][0] - kept[i - 1][0]
+            val v1y = kept[i][1] - kept[i - 1][1]
+            val v2x = kept[i + 1][0] - kept[i][0]
+            val v2y = kept[i + 1][1] - kept[i][1]
+            val l1 = hypot(v1x, v1y)
+            val l2 = hypot(v2x, v2y)
+            if (l1 == 0f || l2 == 0f) continue
+            val cos = (v1x * v2x + v1y * v2y) / (l1 * l2)
+            if (cos < 0.5f) addCorner(kept[i][0], kept[i][1])
+        }
+        addCorner(kept[kept.size - 1][0], kept[kept.size - 1][1])
+
+        if (keys.size >= 2) onSwipe(keys, corners)
+    }
+}
+
 /**
  * Scientific Keyboard: QWERTY + গাণিতিক চিহ্ন + শব্দ সাজেশন + ইমোজি + ক্লিপবোর্ড
  * + টেক্সট এডিট + ভয়েস টাইপিং + থিম। UI পুরোটাই কোডে তৈরি।
  */
 class SciKeyboardService : InputMethodService() {
 
-    private enum class Page { LETTERS, NUMBERS, SYMBOLS, EMOJI, CLIP, EDIT, NUMPAD, THEME }
+    private enum class Page { LETTERS, NUMBERS, SYMBOLS, EMOJI, SEARCH, CLIP, EDIT, NUMPAD, THEME, BANGLA, STICKER }
     private enum class Script { NONE, SUP, SUB }
     private enum class Kind { KEY, FUNC, FLAT, ACCENT }
 
@@ -91,7 +288,23 @@ class SciKeyboardService : InputMethodService() {
     private var lastShiftTap = 0L
     private var script = Script.NONE
     private var category = 0
-    private var emojiCat = 0
+    private var emojiCat = 2          // 0 = সাম্প্রতিক, 1 = সার্চ, 2+ = ক্যাটাগরি
+    private var bnLayer = 0
+    private var emojiQuery = ""
+    private var variantFor: String? = null
+    private var variantList: List<String> = emptyList()
+
+    // অটোকারেক্ট (আসল শব্দ, যা বসেছে), সোয়াইপের বিকল্প শব্দ
+    private var lastCorrection: Pair<String, String>? = null
+    private var swipeAlt: List<String>? = null
+    private var swipeText = ""
+
+    // শর্টকাট (text expander) ক্যাশ
+    private var shortcutRaw = ""
+    private var shortcutCache: Map<String, String> = emptyMap()
+
+    // স্টিকারের থাম্বনেইল ক্যাশ
+    private val thumbs = HashMap<String, Bitmap>()
     private var toolsOpen = false
     private var selectMode = false
 
@@ -161,6 +374,9 @@ class SciKeyboardService : InputMethodService() {
             script = Script.NONE
             toolsOpen = false
             selectMode = false
+            variantFor = null
+            lastCorrection = null
+            swipeAlt = null
             val cls = (info?.inputType ?: 0) and InputType.TYPE_MASK_CLASS
             page = if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE) {
                 Page.NUMBERS
@@ -246,6 +462,8 @@ class SciKeyboardService : InputMethodService() {
     private fun go(p: Page) {
         page = p
         toolsOpen = false
+        variantFor = null
+        swipeAlt = null
         suggestions = emptyList()
         render()
         updateSuggestions()
@@ -265,6 +483,12 @@ class SciKeyboardService : InputMethodService() {
             }
             Page.SYMBOLS -> buildSymbols()
             Page.EMOJI -> buildEmoji()
+            Page.SEARCH -> buildSearch()
+            Page.BANGLA -> {
+                root.addView(newStrip())
+                buildBangla()
+            }
+            Page.STICKER -> buildSticker()
             Page.CLIP -> buildClip()
             Page.EDIT -> buildEdit()
             Page.NUMPAD -> buildNumpad()
@@ -274,8 +498,21 @@ class SciKeyboardService : InputMethodService() {
 
     private fun buildLetters() {
         val up = shift || caps
-        root.addView(rowOf(letterKeys("qwertyuiop", "1234567890", up)))
-        root.addView(
+        val tc = skin.accent
+        val swipe = SwipeLayout(
+            this,
+            { prefs.swipe && script == Script.NONE && page == Page.LETTERS },
+            dp(14),
+            dp(5).toFloat(),
+            Color.argb(170, Color.red(tc), Color.green(tc), Color.blue(tc)),
+            { keys, corners -> onSwipeWord(keys, corners) }
+        )
+        swipe.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        swipe.addView(rowOf(letterKeys("qwertyuiop", "1234567890", up)))
+        swipe.addView(
             rowOf(
                 listOf(spacer(0.5f)) +
                     letterKeys("asdfghjkl", "@#&*-!?()", up) +
@@ -287,7 +524,8 @@ class SciKeyboardService : InputMethodService() {
         r3.add(shiftKey())
         r3.addAll(letterKeys("zxcvbnm", "\"×÷√':/", up))
         r3.add(backspaceKey(1.5f))
-        root.addView(rowOf(r3))
+        swipe.addView(rowOf(r3))
+        root.addView(swipe)
 
         root.addView(
             rowOf(
@@ -295,9 +533,41 @@ class SciKeyboardService : InputMethodService() {
                     key("?123", 1.3f, Kind.FUNC, 15f) { go(Page.NUMBERS) },
                     key("☺", 1.1f, Kind.FUNC, 20f) { go(Page.EMOJI) },
                     key(",", 1f) { typeKey(",") },
-                    key("◂  English  ▸", 4f, Kind.KEY, 14f, skin.hint) { pressSpace() },
+                    key("বাং", 1.2f, Kind.FUNC, 14f) { go(Page.BANGLA) },
+                    key("◂  English  ▸", 3f, Kind.KEY, 14f, skin.hint) { pressSpace() },
                     key(".", 1f) { typeKey(".") },
                     enterKey(1.4f)
+                )
+            )
+        )
+    }
+
+    /** বাংলা কীবোর্ড: ৩টা স্তর (ব্যঞ্জন / স্বর-কার / সংখ্যা-যতিচিহ্ন)। */
+    private fun buildBangla() {
+        val n = BanglaData.layers.size
+        val layer = BanglaData.layers[bnLayer.coerceIn(0, n - 1)]
+        layer.rows.forEach { r ->
+            root.addView(
+                rowOf(
+                    r.map { sym ->
+                        key(BanglaData.display(sym), 1f, Kind.KEY, 20f) { commit(BanglaData.insert(sym)) }
+                    }
+                )
+            )
+        }
+        val next = BanglaData.layers[(bnLayer + 1) % n].label
+        root.addView(
+            rowOf(
+                listOf(
+                    key("ABC", 1.3f, Kind.FUNC, 15f) { go(Page.LETTERS) },
+                    key(next, 1.3f, Kind.FUNC, 16f) {
+                        bnLayer = (bnLayer + 1) % n
+                        render()
+                    },
+                    key("বাংলা", 3f, Kind.KEY, 13f, skin.hint) { commit(" ") },
+                    key("।", 1f) { commit("।") },
+                    backspaceKey(1.3f),
+                    enterKey(1.3f)
                 )
             )
         )
@@ -334,7 +604,7 @@ class SciKeyboardService : InputMethodService() {
         cats[category].items.chunked(COLS).forEach { chunk ->
             val cells = ArrayList<View>()
             chunk.forEach { sym ->
-                cells.add(key(sym.label, 1f, Kind.KEY, 20f) { commitSymbol(sym.insert) })
+                cells.add(key(sym.label, 1f, Kind.KEY, if (sym.label.length > 3) 14f else 20f) { commitSym(sym) })
             }
             repeat(COLS - chunk.size) { cells.add(spacer(1f)) }
             grid.addView(rowOf(cells))
@@ -345,22 +615,282 @@ class SciKeyboardService : InputMethodService() {
 
     private fun buildEmoji() {
         val cats = EmojiData.categories
-        root.addView(tabsRow(cats.map { it.icon }, emojiCat) { i ->
-            emojiCat = i
-            render()
-        })
+        val labels = listOf("🕘", "🔍") + cats.map { it.icon }
+        val vf = variantFor
+        if (vf != null) {
+            root.addView(variantRow(vf))
+        } else {
+            root.addView(tabsRow(labels, emojiCat) { i ->
+                if (i == 1) {
+                    emojiQuery = ""
+                    go(Page.SEARCH)
+                } else {
+                    emojiCat = i
+                    render()
+                }
+            })
+        }
 
         val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        cats[emojiCat].items.chunked(COLS).forEach { chunk ->
+        val items: List<String>
+        val cols: Int
+        val size: Float
+        if (emojiCat == 0) {
+            items = prefs.recentEmoji.filter { EmojiData.supported(it) }
+            cols = COLS
+            size = 24f
+        } else {
+            val cat = cats[(emojiCat - 2).coerceIn(0, cats.size - 1)]
+            items = cat.items()
+            cols = cat.cols
+            size = cat.textSize
+        }
+        if (items.isEmpty()) {
+            grid.addView(
+                TextView(this).apply {
+                    text = "No recent emoji yet.\nEmoji you use will show up here."
+                    setTextColor(skin.hint)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                    gravity = Gravity.CENTER
+                    setPadding(dp(8), dp(24), dp(8), dp(8))
+                }
+            )
+        }
+        items.chunked(cols).forEach { chunk ->
             val cells = ArrayList<View>()
             chunk.forEach { e ->
-                cells.add(key(e, 1f, Kind.FLAT, 24f, skin.text) { commitSymbol(e) })
+                cells.add(
+                    key(e, 1f, Kind.FLAT, size, skin.text, onLong = { showVariants(e) }) {
+                        commitEmoji(e)
+                    }
+                )
             }
-            repeat(COLS - chunk.size) { cells.add(spacer(1f)) }
+            repeat(cols - chunk.size) { cells.add(spacer(1f)) }
             grid.addView(rowOf(cells))
         }
         root.addView(scrollArea(grid))
         root.addView(bottomBar())
+    }
+
+    /** ইমোজি চেপে ধরলে skin tone-এর সারি। */
+    private fun showVariants(e: String) {
+        val v = EmojiData.skinVariants(e) ?: return
+        variantFor = e
+        variantList = v
+        render()
+    }
+
+    private fun variantRow(base: String): View {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(STRIP_H)
+        )
+        (listOf(base) + variantList).forEach { v ->
+            row.addView(
+                key(v, 1f, Kind.KEY, 22f) {
+                    variantFor = null
+                    commitEmoji(v)
+                    render()
+                }
+            )
+        }
+        row.addView(
+            key("✕", 1f, Kind.FUNC, 16f) {
+                variantFor = null
+                render()
+            }
+        )
+        return row
+    }
+
+    private fun commitEmoji(e: String) {
+        prefs.addRecentEmoji(e)
+        commitSymbol(e)
+    }
+
+    /** ইমোজি সার্চ: উপরে লেখা + ফলাফল, নিচে ছোট QWERTY। */
+    private fun buildSearch() {
+        val results = EmojiNames.search(emojiQuery, 40)
+
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(rowH())
+        )
+        val q = TextView(this)
+        q.text = if (emojiQuery.isEmpty()) "🔍 heart, hasi…" else "🔍 $emojiQuery"
+        q.setTextColor(if (emojiQuery.isEmpty()) skin.hint else skin.text)
+        q.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        q.typeface = font
+        q.gravity = Gravity.CENTER_VERTICAL
+        q.isSingleLine = true
+        q.ellipsize = TextUtils.TruncateAt.START
+        q.setPadding(dp(8), 0, dp(4), 0)
+        top.addView(q, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.3f))
+
+        val inner = LinearLayout(this)
+        inner.orientation = LinearLayout.HORIZONTAL
+        results.forEach { e -> inner.addView(fixedKey(e, false, skin.text) { commitEmoji(e) }) }
+        val sc = HorizontalScrollView(this)
+        sc.isHorizontalScrollBarEnabled = false
+        sc.addView(inner)
+        top.addView(sc, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2.7f))
+        root.addView(top)
+
+        root.addView(rowOf(searchKeys("qwertyuiop")))
+        root.addView(rowOf(listOf(spacer(0.5f)) + searchKeys("asdfghjkl") + listOf(spacer(0.5f))))
+        root.addView(
+            rowOf(
+                listOf(spacer(1.5f)) + searchKeys("zxcvbnm") +
+                    listOf(
+                        key("⌫", 1.5f, Kind.FUNC, 20f) {
+                            emojiQuery = emojiQuery.dropLast(1)
+                            render()
+                        }
+                    )
+            )
+        )
+        root.addView(
+            rowOf(
+                listOf(
+                    key("☺", 1.3f, Kind.FUNC, 20f) { go(Page.EMOJI) },
+                    key("space", 4f, Kind.KEY, 13f, skin.hint) {
+                        emojiQuery += " "
+                        render()
+                    },
+                    key("✕", 1.3f, Kind.FUNC, 16f) {
+                        emojiQuery = ""
+                        render()
+                    },
+                    key("ABC", 1.3f, Kind.FUNC, 15f) { go(Page.LETTERS) }
+                )
+            )
+        )
+    }
+
+    private fun searchKeys(chars: String): List<View> =
+        chars.map { ch ->
+            key(ch.toString(), 1f, Kind.KEY, 20f) {
+                emojiQuery += ch
+                render()
+            }
+        }
+
+    // ---------------------------------------------------------------- stickers / GIF
+
+    private fun openExtras() {
+        val i = Intent(this, ExtrasActivity::class.java)
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(i)
+    }
+
+    private fun buildSticker() {
+        root.addView(titleRow("Stickers & GIFs", "Manage") { openExtras() })
+        val files = prefs.stickerFiles()
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        if (files.isEmpty()) {
+            col.addView(
+                TextView(this).apply {
+                    text = "No stickers yet.\nTap Manage to add your own images or GIFs."
+                    setTextColor(skin.hint)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                    gravity = Gravity.CENTER
+                    setPadding(dp(8), dp(24), dp(8), dp(8))
+                }
+            )
+        } else {
+            files.chunked(4).forEach { chunk ->
+                val r = LinearLayout(this)
+                r.orientation = LinearLayout.HORIZONTAL
+                r.layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(rowH() + 24)
+                )
+                chunk.forEach { f -> r.addView(stickerCell(f)) }
+                repeat(4 - chunk.size) { r.addView(spacer(1f)) }
+                col.addView(r)
+            }
+        }
+        root.addView(scrollArea(col))
+        root.addView(bottomBar())
+    }
+
+    private fun stickerCell(f: File): View {
+        val cell = FrameLayout(this)
+        cell.isClickable = true
+        cell.background = keyBackground(0)
+        cell.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+            .apply { setMargins(dp(3), dp(3), dp(3), dp(3)) }
+        val iv = ImageView(this)
+        iv.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        thumb(f)?.let { iv.setImageBitmap(it) }
+        cell.addView(
+            iv,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        cell.setOnClickListener {
+            tick(it)
+            sendSticker(f)
+        }
+        return cell
+    }
+
+    private fun thumb(f: File): Bitmap? {
+        thumbs[f.path]?.let { return it }
+        return try {
+            val o = BitmapFactory.Options()
+            o.inJustDecodeBounds = true
+            BitmapFactory.decodeFile(f.path, o)
+            var sample = 1
+            while (o.outWidth / sample > 240 || o.outHeight / sample > 240) sample *= 2
+            val o2 = BitmapFactory.Options()
+            o2.inSampleSize = sample
+            val b = BitmapFactory.decodeFile(f.path, o2)
+            if (b != null) {
+                if (thumbs.size > 80) thumbs.clear()
+                thumbs[f.path] = b
+            }
+            b
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    /** ছবি/GIF সরাসরি টেক্সট ফিল্ডে পাঠায় (যে অ্যাপ নেয় শুধু সেখানে)। */
+    private fun sendSticker(f: File) {
+        val ic = currentInputConnection
+        val ei = currentInputEditorInfo
+        if (ic == null || ei == null) return
+        val mime = when (f.extension.lowercase()) {
+            "gif" -> "image/gif"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            else -> "image/jpeg"
+        }
+        val accepted = EditorInfoCompat.getContentMimeTypes(ei)
+        if (accepted.none { ClipDescription.compareMimeTypes(mime, it) }) {
+            toast("This app does not accept stickers or GIFs")
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.stickers", f)
+            val info = InputContentInfoCompat(uri, ClipDescription(f.name, arrayOf(mime)), null)
+            var flags = 0
+            if (Build.VERSION.SDK_INT >= 25) {
+                flags = flags or InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION
+            }
+            if (!InputConnectionCompat.commitContent(ic, ei, info, flags, null)) {
+                toast("Could not send this sticker")
+            }
+        } catch (e: Throwable) {
+            toast("Could not send this sticker")
+        }
     }
 
     private fun buildClip() {
@@ -451,63 +981,280 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun buildThemePage() {
-        root.addView(titleRow("Theme & font", null) { })
+        root.addView(titleRow("✦ Settings", null) { })
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val full = { LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) }
 
+        // ---- থিম
+        col.addView(sectionLabel("Theme"))
         Themes.all.chunked(3).forEach { chunk ->
-            val cells = ArrayList<View>()
-            chunk.forEach { t -> cells.add(themeSwatch(t)) }
-            repeat(3 - chunk.size) { cells.add(spacer(1f)) }
-            col.addView(rowOf(cells))
+            val r = LinearLayout(this)
+            r.orientation = LinearLayout.HORIZONTAL
+            r.layoutParams = full()
+            chunk.forEach { t -> r.addView(themeCard(t)) }
+            repeat(3 - chunk.size) { r.addView(spacer(1f)) }
+            col.addView(r)
         }
+
+        // ---- ফন্ট
+        col.addView(sectionLabel("Font"))
         Fonts.all.chunked(3).forEach { chunk ->
-            val cells = ArrayList<View>()
-            chunk.forEach { f ->
-                val selected = f.id == prefs.fontId
-                val k = key(f.name, 1f, if (selected) Kind.ACCENT else Kind.FUNC, 15f) { chooseFont(f.id) }
-                (k.getChildAt(0) as TextView).typeface = Fonts.typeface(f.id)
-                cells.add(k)
-            }
-            repeat(3 - chunk.size) { cells.add(spacer(1f)) }
-            col.addView(rowOf(cells))
+            val r = LinearLayout(this)
+            r.orientation = LinearLayout.HORIZONTAL
+            r.layoutParams = full()
+            chunk.forEach { f -> r.addView(fontChip(f)) }
+            repeat(3 - chunk.size) { r.addView(spacer(1f)) }
+            col.addView(r)
         }
-        col.addView(
-            rowOf(
-                listOf(
-                    key("My photo: choose in app", 1f, Kind.FUNC, 14f) {
-                        val i = Intent(this, MainActivity::class.java)
-                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        startActivity(i)
-                    }
-                )
-            )
+
+        // ---- কীবোর্ড
+        col.addView(sectionLabel("Keyboard"))
+        val stepper = LinearLayout(this)
+        stepper.orientation = LinearLayout.HORIZONTAL
+        stepper.gravity = Gravity.CENTER_VERTICAL
+        stepper.addView(roundBtn("−") {
+            prefs.heightPct = prefs.heightPct - 10
+            render()
+        })
+        stepper.addView(
+            TextView(this).apply {
+                text = "${prefs.heightPct}%"
+                setTextColor(skin.text)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                typeface = font
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(dp(52), ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
         )
+        stepper.addView(roundBtn("+") {
+            prefs.heightPct = prefs.heightPct + 10
+            render()
+        })
+        col.addView(settingRow("↕", "Keyboard height", "Make keys taller or shorter", stepper, null))
+        col.addView(toggleRow("🔊", "Key sound", "Click sound on every key", prefs.sound) { prefs.sound = !prefs.sound })
+        col.addView(toggleRow("📳", "Vibration", "Small buzz on every key", prefs.haptic) { prefs.haptic = !prefs.haptic })
+
+        // ---- টাইপিং
+        col.addView(sectionLabel("Typing"))
+        col.addView(toggleRow("✨", "Autocorrect", "Fix one-letter typos on space", prefs.autocorrect) { prefs.autocorrect = !prefs.autocorrect })
+        col.addView(toggleRow("👆", "Swipe typing", "Slide over letters to type a word", prefs.swipe) { prefs.swipe = !prefs.swipe })
+
+        // ---- আরও
+        col.addView(sectionLabel("More"))
+        col.addView(settingRow("🧩", "Shortcuts & stickers", "Text shortcuts, your own stickers and GIFs", chevron()) { openExtras() })
+        col.addView(settingRow("🖼", "Photo theme & language", "Opens the app settings", chevron()) {
+            val i = Intent(this, MainActivity::class.java)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+        })
+
         root.addView(scrollArea(col))
         root.addView(bottomBar())
     }
 
-    private fun themeSwatch(t: KeyTheme): View {
-        val selected = t.id == prefs.themeId
-        val f = FrameLayout(this)
-        f.isClickable = true
-        val shape = GradientDrawable()
-        shape.cornerRadius = dp(6).toFloat()
-        shape.setColor(if (t.key != 0) t.key else t.bg)
-        shape.setStroke(dp(if (selected) 3 else 1), if (selected) t.accent else Color.GRAY)
-        f.background = shape
-        f.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
-            .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) }
+    private fun cardColor(): Int = if (skin.func != 0) skin.func else Color.argb(48, 255, 255, 255)
+
+    private fun sectionLabel(text: String): View {
         val tv = TextView(this)
-        tv.text = t.name
+        tv.text = text.uppercase()
+        tv.setTextColor(skin.accent)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        tv.typeface = Typeface.create(font, Typeface.BOLD)
+        tv.letterSpacing = 0.14f
+        tv.setPadding(dp(10), dp(12), 0, dp(4))
+        tv.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        return tv
+    }
+
+    /** একটা সুন্দর কার্ড-সারি: বাঁয়ে আইকন, মাঝে নাম ও ছোট বর্ণনা, ডানে [trailing]। */
+    private fun settingRow(icon: String, title: String, sub: String?, trailing: View?, onTap: (() -> Unit)?): View {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(14).toFloat()
+        bg.setColor(cardColor())
+        row.background = bg
+        row.setPadding(dp(12), 0, dp(12), 0)
+        row.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(rowH() - 2)
+        ).apply { setMargins(dp(4), dp(3), dp(4), dp(3)) }
+
+        val ic = TextView(this)
+        ic.text = icon
+        ic.setTextColor(skin.text)
+        ic.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+        ic.gravity = Gravity.CENTER
+        row.addView(ic, LinearLayout.LayoutParams(dp(32), ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val texts = LinearLayout(this)
+        texts.orientation = LinearLayout.VERTICAL
+        texts.gravity = Gravity.CENTER_VERTICAL
+        val t = TextView(this)
+        t.text = title
+        t.setTextColor(skin.text)
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        t.typeface = font
+        t.isSingleLine = true
+        texts.addView(t)
+        if (sub != null) {
+            val st = TextView(this)
+            st.text = sub
+            st.setTextColor(skin.hint)
+            st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            st.isSingleLine = true
+            st.ellipsize = TextUtils.TruncateAt.END
+            texts.addView(st)
+        }
+        row.addView(
+            texts,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { leftMargin = dp(8); rightMargin = dp(8) }
+        )
+        if (trailing != null) row.addView(trailing)
+        if (onTap != null) {
+            row.isClickable = true
+            row.setOnClickListener {
+                tick(it)
+                onTap()
+            }
+        }
+        return row
+    }
+
+    private fun toggleRow(icon: String, title: String, sub: String, on: Boolean, action: () -> Unit): View =
+        settingRow(icon, title, sub, pillSwitch(on)) {
+            action()
+            render()
+        }
+
+    private fun pillSwitch(on: Boolean): View {
+        val track = FrameLayout(this)
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(13).toFloat()
+        bg.setColor(if (on) skin.accent else Color.argb(110, 150, 150, 150))
+        track.background = bg
+        val knob = View(this)
+        val kb = GradientDrawable()
+        kb.shape = GradientDrawable.OVAL
+        kb.setColor(Color.WHITE)
+        knob.background = kb
+        val lp = FrameLayout.LayoutParams(
+            dp(20), dp(20),
+            (if (on) Gravity.END else Gravity.START) or Gravity.CENTER_VERTICAL
+        )
+        lp.setMargins(dp(3), 0, dp(3), 0)
+        track.addView(knob, lp)
+        track.layoutParams = LinearLayout.LayoutParams(dp(46), dp(26))
+        return track
+    }
+
+    private fun roundBtn(label: String, onTap: () -> Unit): View {
+        val tv = TextView(this)
+        tv.text = label
         tv.gravity = Gravity.CENTER
-        tv.setTextColor(t.text)
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        f.addView(tv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        f.setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        tv.setTextColor(Color.WHITE)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+        val bg = GradientDrawable()
+        bg.shape = GradientDrawable.OVAL
+        bg.setColor(skin.accent)
+        tv.background = bg
+        tv.layoutParams = LinearLayout.LayoutParams(dp(30), dp(30))
+        tv.isClickable = true
+        tv.setOnClickListener {
+            tick(it)
+            onTap()
+        }
+        return tv
+    }
+
+    private fun chevron(): View {
+        val tv = TextView(this)
+        tv.text = "›"
+        tv.setTextColor(skin.hint)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+        return tv
+    }
+
+    /** থিমের কার্ড: থিমের নিজের রঙে ছোট কী-র নমুনাসহ। */
+    private fun themeCard(t: KeyTheme): View {
+        val selected = t.id == prefs.themeId
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.gravity = Gravity.CENTER
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(14).toFloat()
+        bg.setColor(t.bg)
+        bg.setStroke(
+            dp(if (selected) 3 else 1),
+            if (selected) t.accent else Color.argb(90, 128, 128, 128)
+        )
+        card.background = bg
+
+        val mini = LinearLayout(this)
+        mini.orientation = LinearLayout.HORIZONTAL
+        mini.gravity = Gravity.CENTER
+        for (i in 0 until 3) {
+            val k = View(this)
+            val kb = GradientDrawable()
+            kb.cornerRadius = dp(3).toFloat()
+            kb.setColor(
+                if (i == 2) t.accent
+                else if (t.key != 0) t.key
+                else Color.argb(110, 255, 255, 255)
+            )
+            k.background = kb
+            mini.addView(
+                k,
+                LinearLayout.LayoutParams(dp(16), dp(10)).apply { setMargins(dp(2), 0, dp(2), 0) }
+            )
+        }
+        card.addView(mini)
+
+        val name = TextView(this)
+        name.text = (if (selected) "✓ " else "") + t.name
+        name.setTextColor(t.text)
+        name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        name.gravity = Gravity.CENTER
+        name.isSingleLine = true
+        name.setPadding(dp(4), dp(6), dp(4), 0)
+        card.addView(name)
+
+        card.layoutParams = LinearLayout.LayoutParams(0, dp(64), 1f)
+            .apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
+        card.isClickable = true
+        card.setOnClickListener {
+            tick(it)
             chooseTheme(t.id)
         }
-        return f
+        return card
+    }
+
+    private fun fontChip(f: Fonts.FontOpt): View {
+        val selected = f.id == prefs.fontId
+        val tv = TextView(this)
+        tv.text = f.name
+        tv.typeface = Fonts.typeface(f.id)
+        tv.gravity = Gravity.CENTER
+        tv.isSingleLine = true
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        tv.setTextColor(if (selected) Color.WHITE else skin.text)
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(20).toFloat()
+        bg.setColor(if (selected) skin.accent else cardColor())
+        tv.background = bg
+        tv.layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
+            .apply { setMargins(dp(4), dp(3), dp(4), dp(3)) }
+        tv.isClickable = true
+        tv.setOnClickListener {
+            tick(it)
+            chooseFont(f.id)
+        }
+        return tv
     }
 
     // ---------------------------------------------------------------- top toolbar
@@ -570,6 +1317,8 @@ class SciKeyboardService : InputMethodService() {
         val inner = LinearLayout(this)
         inner.orientation = LinearLayout.HORIZONTAL
         inner.addView(fixedKey("☺", false) { go(Page.EMOJI) })
+        inner.addView(fixedKey("🖼", false) { go(Page.STICKER) })
+        inner.addView(fixedKey("বাং", false) { go(Page.BANGLA) })
         inner.addView(fixedKey("📋", false) { go(Page.CLIP) })
         inner.addView(fixedKey("✎", false) { go(Page.EDIT) })
         inner.addView(fixedKey("123", false) { go(Page.NUMPAD) })
@@ -638,7 +1387,9 @@ class SciKeyboardService : InputMethodService() {
         chars.mapIndexed { i, ch ->
             val t = if (upper) ch.uppercaseChar().toString() else ch.toString()
             val h = hints[i].toString()
-            key(t, 1f, Kind.KEY, 22f, hint = h, onLong = { typeKey(h) }) { typeKey(t) }
+            val v = key(t, 1f, Kind.KEY, 22f, hint = h, onLong = { typeKey(h) }) { typeKey(t) }
+            v.tag = ch.lowercaseChar()
+            v
         }
 
     private fun plainKeys(chars: String): List<View> =
@@ -677,7 +1428,7 @@ class SciKeyboardService : InputMethodService() {
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     view.isPressed = true
-                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                    tick(view)
                     backspace()
                     handler.postDelayed(repeater, 400)
                 }
@@ -703,7 +1454,7 @@ class SciKeyboardService : InputMethodService() {
     ): FrameLayout {
         val v = frameKey(label, weight, kind, textSp, textColor, hint)
         v.setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            tick(it)
             onTap()
         }
         if (onLong != null) {
@@ -783,7 +1534,7 @@ class SciKeyboardService : InputMethodService() {
     private fun rowOf(items: List<View>): LinearLayout =
         LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(ROW_H))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(rowH()))
             items.forEach { addView(it) }
         }
 
@@ -843,7 +1594,7 @@ class SciKeyboardService : InputMethodService() {
             isVerticalScrollBarEnabled = false
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(ROW_H * 3)
+                dp(rowH() * 3)
             )
             addView(content)
         }
@@ -854,7 +1605,7 @@ class SciKeyboardService : InputMethodService() {
         f.background = keyBackground(if (skin.key != 0) skin.key else skin.func)
         f.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(ROW_H - 8)
+            dp(rowH() - 8)
         ).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) }
         val tv = TextView(this)
         tv.text = text.replace('\n', ' ')
@@ -873,7 +1624,7 @@ class SciKeyboardService : InputMethodService() {
             )
         )
         f.setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            tick(it)
             onTap()
         }
         return f
@@ -892,6 +1643,22 @@ class SciKeyboardService : InputMethodService() {
         )
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /** সারির উচ্চতা (dp), সেটিংয়ের শতাংশ অনুযায়ী। */
+    private fun rowH(): Int = ROW_H * prefs.heightPct / 100
+
+    /** কী চাপার ভাইব্রেশন/সাউন্ড (সেটিং অনুযায়ী)। */
+    private fun tick(v: View) {
+        if (prefs.haptic) v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (prefs.sound) {
+            try {
+                (getSystemService(Context.AUDIO_SERVICE) as AudioManager)
+                    .playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD, 0.5f)
+            } catch (e: Throwable) {
+                // সাউন্ড না বাজলে সমস্যা নেই
+            }
+        }
+    }
 
     private fun toast(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
@@ -955,7 +1722,7 @@ class SciKeyboardService : InputMethodService() {
         })
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, prefs.voiceLang)
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (page == Page.BANGLA) "bn-BD" else prefs.voiceLang)
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         listening = true
@@ -1048,6 +1815,7 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun updateSuggestions() {
+        if (swipeAlt != null && page == Page.LETTERS) return
         val next: List<String> =
             if (!learning || script != Script.NONE || page != Page.LETTERS) {
                 emptyList()
@@ -1071,6 +1839,10 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun acceptSuggestion(word: String) {
+        if (swipeAlt != null) {
+            replaceSwipe(word)
+            return
+        }
         val ic = currentInputConnection ?: return
         val before = textBefore(48)
         val i = prefixStart(before)
@@ -1087,7 +1859,15 @@ class SciKeyboardService : InputMethodService() {
     // ---------------------------------------------------------------- input actions
 
     private fun commit(s: String) {
+        lastCorrection = null
+        swipeAlt = null
         currentInputConnection?.commitText(s, 1)
+    }
+
+    /** সিম্বল/টেমপ্লেট বসায়; [Sym.back] থাকলে কার্সর ভেতরে সরায়। */
+    private fun commitSym(sym: Sym) {
+        commitSymbol(sym.insert)
+        repeat(sym.back) { pressKeyCode(KeyEvent.KEYCODE_DPAD_LEFT) }
     }
 
     /** চিহ্ন বসানোর আগে চলতি শব্দটা শিখে নেয়। */
@@ -1120,12 +1900,157 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun pressSpace() {
+        val before = textBefore(48)
+        if (expandShortcut(before)) return
+        if (autoCorrect(before)) return
         learnCurrent()
         commit(" ")
         updateSuggestions()
     }
 
+    // ---------------------------------------------------------------- shortcuts / autocorrect / swipe
+
+    private fun shortcuts(): Map<String, String> {
+        val raw = prefs.shortcutsRaw
+        if (raw != shortcutRaw) {
+            shortcutRaw = raw
+            shortcutCache = prefs.shortcuts()
+        }
+        return shortcutCache
+    }
+
+    /** শর্টকাট লিখে space চাপলে পুরো লেখা বসায়। */
+    private fun expandShortcut(before: String): Boolean {
+        val map = shortcuts()
+        if (map.isEmpty() || before.isEmpty()) return false
+        var i = before.length
+        while (i > 0 && !before[i - 1].isWhitespace()) i--
+        val token = before.substring(i)
+        if (token.isEmpty()) return false
+        val expansion = map[token] ?: return false
+        val ic = currentInputConnection ?: return false
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(token.length, 0)
+        ic.commitText("$expansion ", 1)
+        ic.endBatchEdit()
+        lastCorrection = null
+        swipeAlt = null
+        updateSuggestions()
+        return true
+    }
+
+    /** space চাপলে ভুল বানান (১টা অক্ষর ভুল) ঠিক করে। ব্যাকস্পেস দিলে আগের শব্দ ফিরে আসে। */
+    private fun autoCorrect(before: String): Boolean {
+        if (!prefs.autocorrect || !learning || script != Script.NONE || page != Page.LETTERS) return false
+        val i = prefixStart(before)
+        val word = before.substring(i)
+        if (word.length < 3) return false
+        if (i > 0 && !before[i - 1].isWhitespace()) return false
+        if (word.drop(1).any { it.isUpperCase() }) return false
+        val fix = store.correct(word) ?: return false
+        val out = capLike(fix, word)
+        val ic = currentInputConnection ?: return false
+        val prev = previousWord(before.substring(0, i))
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(word.length, 0)
+        ic.commitText("$out ", 1)
+        ic.endBatchEdit()
+        store.learn(out, prev)
+        lastCorrection = Pair(word, out)
+        swipeAlt = null
+        updateSuggestions()
+        return true
+    }
+
+    /** swipe-এর পথ থেকে সম্ভাব্য শব্দ (সবচেয়ে ভালোটা আগে)। */
+    private fun swipeCandidates(s: String, corners: List<Char>): List<String> {
+        val first = s[0]
+        val last = s[s.length - 1]
+        val scored = ArrayList<Pair<Int, String>>()
+        for (w in store.allWords()) {
+            if (w.length < 2 || w[0] != first || w[w.length - 1] != last) continue
+            // পরপর একই অক্ষর (hello → helo) একটা ধরি, কারণ আঙুল একই কী-তে একবারই যায়
+            val sb = StringBuilder()
+            for (ch in w) if (sb.isEmpty() || sb[sb.length - 1] != ch) sb.append(ch)
+            val wl = sb.toString()
+            if (wl.length > s.length) continue
+            var idx = 0
+            for (ch in s) if (idx < wl.length && wl[idx] == ch) idx++
+            if (idx < wl.length) continue
+            var j = 0
+            var ok = true
+            for (c in corners) {
+                var found = false
+                while (j < wl.length) {
+                    if (wl[j] == c) {
+                        found = true
+                        j++
+                        break
+                    }
+                    j++
+                }
+                if (!found) {
+                    ok = false
+                    break
+                }
+            }
+            if (!ok) continue
+            val extra = s.length - wl.length
+            scored.add(Pair(store.scoreOf(w) * 10 - extra * 4 + wl.length, w))
+        }
+        return scored.sortedByDescending { it.first }.map { it.second }.take(3)
+    }
+
+    /** আঙুল টেনে শব্দ লেখা শেষ হলে ডাকা হয়। */
+    private fun onSwipeWord(keys: List<Char>, corners: List<Char>) {
+        if (page != Page.LETTERS || script != Script.NONE) return
+        val s = keys.joinToString("")
+        if (s.length < 2) return
+        val cands = swipeCandidates(s, corners)
+        if (cands.isEmpty()) return
+        val ic = currentInputConnection ?: return
+        val up = shift || caps
+        val words = cands.map { w -> if (up) w.replaceFirstChar { c -> c.uppercaseChar() } else w }
+        val before = textBefore(2)
+        learnCurrent()
+        val sb = StringBuilder()
+        if (before.isNotEmpty() && !before[before.length - 1].isWhitespace() &&
+            before[before.length - 1] !in "([{\"'"
+        ) sb.append(' ')
+        sb.append(words[0]).append(' ')
+        ic.commitText(sb.toString(), 1)
+        if (learning) store.learn(words[0].lowercase())
+        lastCorrection = null
+        swipeAlt = words
+        swipeText = words[0] + " "
+        suggestions = words
+        if (shift && !caps) {
+            shift = false
+            render()
+        } else {
+            fillStrip()
+        }
+    }
+
+    /** swipe করা শব্দের জায়গায় অন্য বিকল্প বসায়। */
+    private fun replaceSwipe(word: String) {
+        val ic = currentInputConnection ?: return
+        if (textBefore(swipeText.length) != swipeText) {
+            swipeAlt = null
+            updateSuggestions()
+            return
+        }
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(swipeText.length, 0)
+        ic.commitText("$word ", 1)
+        ic.endBatchEdit()
+        swipeText = "$word "
+        if (learning) store.learn(word.lowercase())
+    }
+
     private fun pressEnter() {
+        lastCorrection = null
+        swipeAlt = null
         learnCurrent()
         val ic = currentInputConnection ?: return
         val ei = currentInputEditorInfo
@@ -1151,6 +2076,24 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun backspace() {
+        val lc = lastCorrection
+        if (lc != null) {
+            lastCorrection = null
+            val ic = currentInputConnection
+            val applied = lc.second + " "
+            if (ic != null && textBefore(applied.length) == applied) {
+                // অটোকারেক্ট বাতিল: আসল শব্দ ফেরত আসে, আর ওটা পরিচিত শব্দ হয়ে যায়
+                ic.beginBatchEdit()
+                ic.deleteSurroundingText(applied.length, 0)
+                ic.commitText(lc.first, 1)
+                ic.endBatchEdit()
+                store.learn(lc.first)
+                store.learn(lc.first)
+                updateSuggestions()
+                return
+            }
+        }
+        swipeAlt = null
         doBackspace()
         updateSuggestions()
     }
