@@ -25,6 +25,21 @@
         </activity>
 
         <activity
+            android:name=".ExtrasActivity"
+            android:exported="false"
+            android:label="Shortcuts &amp; stickers" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.stickers"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <activity
             android:name=".MicPermissionActivity"
             android:exported="false"
             android:excludeFromRecents="true"
