@@ -28,10 +28,15 @@ class Prefs(context: Context) {
         get() = sp.getString("voice_lang", "en-US") ?: "en-US"
         set(v) { sp.edit().putString("voice_lang", v).apply() }
 
-    /** কীবোর্ডের উচ্চতা (শতাংশ): 80 থেকে 130, ডিফল্ট 100 */
+    /** কীবোর্ডের উচ্চতা (শতাংশ): 80 থেকে 180, ডিফল্ট 115 (বড় কী, টাইপ করা সহজ) */
     var heightPct: Int
-        get() = sp.getInt("height_pct", 100).coerceIn(80, 130)
-        set(v) { sp.edit().putInt("height_pct", v.coerceIn(80, 130)).apply() }
+        get() = sp.getInt("height_pct", 115).coerceIn(80, 180)
+        set(v) { sp.edit().putInt("height_pct", v.coerceIn(80, 180)).apply() }
+
+    /** ভলিউম বাটন দিয়ে কার্সর সরানো: Vol ▲ = বাঁয়ে, Vol ▼ = ডানে */
+    var volCursor: Boolean
+        get() = sp.getBoolean("vol_cursor", true)
+        set(v) { sp.edit().putBoolean("vol_cursor", v).apply() }
 
     /** কী চাপলে ক্লিক সাউন্ড */
     var sound: Boolean
@@ -45,7 +50,7 @@ class Prefs(context: Context) {
 
     /** অটোকারেক্ট */
     var autocorrect: Boolean
-        get() = sp.getBoolean("autocorrect", true)
+        get() = sp.getBoolean("autocorrect", false)
         set(v) { sp.edit().putBoolean("autocorrect", v).apply() }
 
     /** সোয়াইপ টাইপিং */

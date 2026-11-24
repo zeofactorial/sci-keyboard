@@ -953,7 +953,7 @@ class SciKeyboardService : InputMethodService() {
                 listOf(
                     key("Select all", 1f, Kind.KEY, 13f) { ic(android.R.id.selectAll) },
                     key("Cut", 1f, Kind.KEY, 13f) { ic(android.R.id.cut) },
-                    key("Copy", 1f, Kind.KEY, 13f) { ic(android.R.id.copy) },
+                    key("Copy", 1f, Kind.KEY, 13f) { copySelection() },
                     key("Paste", 1f, Kind.KEY, 13f) { ic(android.R.id.paste) }
                 )
             )
@@ -1087,6 +1087,7 @@ class SciKeyboardService : InputMethodService() {
         // ---- টাইপিং
         col.addView(sectionLabel("Typing"))
         col.addView(toggleRow("✨", "Autocorrect", "Fix one-letter typos on space", prefs.autocorrect) { prefs.autocorrect = !prefs.autocorrect })
+        col.addView(toggleRow("🔊", "Volume keys move cursor", "Vol ▲ = left, Vol ▼ = right", prefs.volCursor) { prefs.volCursor = !prefs.volCursor })
         col.addView(toggleRow("👆", "Swipe typing", "Slide over letters to type a word", prefs.swipe) { prefs.swipe = !prefs.swipe })
         val voiceChip = TextView(this).apply {
             text = if (prefs.voiceLang == "bn-BD") "বাংলা" else "English"
@@ -1470,8 +1471,12 @@ class SciKeyboardService : InputMethodService() {
     private fun letterKeys(chars: String, hints: String, upper: Boolean): List<View> =
         chars.mapIndexed { i, ch ->
             val t = if (upper) ch.uppercaseChar().toString() else ch.toString()
-            val h = hints[i].toString()
-            val v = key(t, 1f, Kind.KEY, 22f, hint = h, onLong = { typeKey(h) }) { typeKey(t) }
+            val isPaste = ch == 'v'
+            val h = if (isPaste) "⎘" else hints[i].toString()
+            val v = key(
+                t, 1f, Kind.KEY, 25f, hint = h,
+                onLong = { if (isPaste) pasteClip() else typeKey(h) }
+            ) { typeKey(t) }
             v.tag = ch.lowercaseChar()
             v
         }
@@ -1884,6 +1889,29 @@ class SciKeyboardService : InputMethodService() {
         }
     }
 
+    /** `v` চেপে ধরলে: সবশেষ কপি করা লেখা বসে যায়। */
+    private fun pasteClip() {
+        val text = try {
+            val clip = clipboard?.primaryClip
+            if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this)?.toString() else null
+        } catch (e: Exception) {
+            null
+        }
+        if (text.isNullOrEmpty()) toast("Clipboard is empty") else commit(text)
+    }
+
+    /** Copy: নির্বাচন/কার্সর যেখানে ছিল সেখানেই থাকে (সিস্টেমের copy অনেক জায়গায় কার্সর শুরুতে নিয়ে যায়)। */
+    private fun copySelection() {
+        val ic = currentInputConnection ?: return
+        val sel = ic.getSelectedText(0)
+        if (!sel.isNullOrEmpty()) {
+            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("text", sel))
+            toast("Copied")
+        } else {
+            ic.performContextMenuAction(android.R.id.copy)
+        }
+    }
+
     private fun switchKeyboard() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
     }
@@ -2207,10 +2235,38 @@ class SciKeyboardService : InputMethodService() {
 
     private fun pressKeyCode(code: Int) {
         val ic = currentInputConnection ?: return
-        val meta = if (selectMode) KeyEvent.META_SHIFT_ON else 0
         val now = SystemClock.uptimeMillis()
-        ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, meta))
-        ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, meta))
+        if (selectMode) {
+            // আসল Shift চাপার মতো: Shift ↓, তীর ↓↑, Shift ↑ — তাই মার্ক করা অংশ বাড়ে, কার্সর শুরুতে ফেরে না
+            val m = KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT, 0, m))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, m))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, m))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
+        } else {
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, 0))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, 0))
+        }
+    }
+
+    // ভলিউম বাটন = কার্সর সরানো (কীবোর্ড খোলা থাকলে): Vol ▲ বাঁয়ে, Vol ▼ ডানে
+    private fun isVolumeKey(code: Int) =
+        code == KeyEvent.KEYCODE_VOLUME_UP || code == KeyEvent.KEYCODE_VOLUME_DOWN
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isVolumeKey(keyCode) && ::prefs.isInitialized && prefs.volCursor && isInputViewShown) {
+            pressKeyCode(
+                if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) KeyEvent.KEYCODE_DPAD_LEFT
+                else KeyEvent.KEYCODE_DPAD_RIGHT
+            )
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isVolumeKey(keyCode) && ::prefs.isInitialized && prefs.volCursor && isInputViewShown) return true
+        return super.onKeyUp(keyCode, event)
     }
 
     private fun backspace() {
