@@ -308,6 +308,7 @@ class SciKeyboardService : InputMethodService() {
     private val thumbs = HashMap<String, Bitmap>()
     private var toolsOpen = false
     private var selectMode = false
+    private val bangla = BanglaInput()
 
     // শব্দ সাজেশন
     private var learning = true
@@ -559,7 +560,15 @@ class SciKeyboardService : InputMethodService() {
                     key("☺", 1.1f, Kind.FUNC, 20f) { go(Page.EMOJI) },
                     key(",", 1f) { typeKey(",") },
                     key("বাং", 1.2f, Kind.FUNC, 14f) { go(Page.BANGLA) },
-                    key("◂  English  ▸", 3f, Kind.KEY, 14f, skin.hint) { pressSpace() },
+                    key(
+                        if (bangla.enabled) "◂  বাংলা  ▸" else "◂  English  ▸",
+                        3f, Kind.KEY, 14f, skin.hint,
+                        onLong = {
+                            bangla.toggle(currentInputConnection)
+                            render()
+                            updateSuggestions()
+                        }
+                    ) { pressSpace() },
                     key(".", 1f) { typeKey(".") },
                     enterKey(1.4f)
                 )
@@ -1983,7 +1992,7 @@ class SciKeyboardService : InputMethodService() {
     private fun updateSuggestions() {
         if (swipeAlt != null && page == Page.LETTERS) return
         val next: List<String> =
-            if (!learning || script != Script.NONE || page != Page.LETTERS) {
+            if (!learning || bangla.enabled || script != Script.NONE || page != Page.LETTERS) {
                 emptyList()
             } else {
                 val before = textBefore(48)
@@ -2025,6 +2034,7 @@ class SciKeyboardService : InputMethodService() {
     // ---------------------------------------------------------------- input actions
 
     private fun commit(s: String) {
+        bangla.finish(currentInputConnection)
         lastCorrection = null
         swipeAlt = null
         currentInputConnection?.commitText(s, 1)
@@ -2051,6 +2061,14 @@ class SciKeyboardService : InputMethodService() {
 
     /** অক্ষর/সংখ্যা টাইপ; x²/x₂ মোড চালু থাকলে সুপার/সাবস্ক্রিপ্টে রূপান্তর করে। */
     private fun typeKey(s: String) {
+        if (bangla.enabled && s.length == 1 && s[0].isLetter() && script == Script.NONE) {
+            bangla.typeLetter(currentInputConnection, s)
+            if (shift && !caps) {
+                shift = false
+                render()
+            }
+            return
+        }
         val out = when (script) {
             Script.SUP -> s.map { (SUPER[it] ?: it).toString() }.joinToString("")
             Script.SUB -> s.map { (SUB[it] ?: it).toString() }.joinToString("")
@@ -2066,6 +2084,10 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun pressSpace() {
+        if (bangla.enabled) {
+            commit(" ")
+            return
+        }
         val before = textBefore(48)
         if (expandShortcut(before)) return
         if (autoCorrect(before)) return
@@ -2293,6 +2315,7 @@ class SciKeyboardService : InputMethodService() {
     }
 
     private fun doBackspace() {
+        if (bangla.backspace(currentInputConnection)) return
         val ic = currentInputConnection ?: return
         val selected = ic.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
