@@ -5,6 +5,7 @@ import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -278,7 +279,7 @@ private class SwipeLayout(
  */
 class SciKeyboardService : InputMethodService() {
 
-    private enum class Page { LETTERS, NUMBERS, SYMBOLS, EMOJI, SEARCH, CLIP, EDIT, NUMPAD, THEME, BANGLA, STICKER }
+    private enum class Page { LETTERS, NUMBERS, SYMBOLS, EMOJI, SEARCH, CLIP, EDIT, NUMPAD, THEME, BANGLA, STICKER, DIGITS }
     private enum class Script { NONE, SUP, SUB }
     private enum class Kind { KEY, FUNC, FLAT, ACCENT }
 
@@ -323,7 +324,26 @@ class SciKeyboardService : InputMethodService() {
 
     // ভয়েস টাইপিং
     private var recognizer: SpeechRecognizer? = null
-    private var listening = false
+    private var listening = false          // true = ব্যবহারকারী নিজে বন্ধ না করা পর্যন্ত শুনতে থাকবে
+    private var voiceFails = 0
+    private val voiceRestart = Runnable { if (listening) startVoice() }
+
+    // অ্যাপের সেটিং স্ক্রিনে কিছু বদলালে কীবোর্ড সাথে সাথে নতুন করে সাজে
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key in LIVE_KEYS) onPrefChanged()
+    }
+
+    private fun onPrefChanged() {
+        if (!::root.isInitialized) return
+        reloadSkin()
+        applyBackground()
+        render()
+        updateSuggestions()
+    }
+
+    // টপ মেনুর নির্বাচিত বাটন সামনে আনা, সেটিংস পেজের স্ক্রল ধরে রাখা
+    private var toolSel = -1
+    private var settingsY = 0
 
     // ক্লিপবোর্ড ইতিহাস (শুধু মেমরিতে থাকে, ডিস্কে সেভ হয় না)
     private val clips = ArrayList<String>()
@@ -339,12 +359,14 @@ class SciKeyboardService : InputMethodService() {
         super.onCreate()
         store = WordStore(this)
         prefs = Prefs(this)
+        prefs.listen(prefListener)
         reloadSkin()
         clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         clipboard?.addPrimaryClipChangedListener(clipListener)
     }
 
     override fun onDestroy() {
+        prefs.unlisten(prefListener)
         store.save()
         clipboard?.removePrimaryClipChangedListener(clipListener)
         recognizer?.destroy()
@@ -364,6 +386,7 @@ class SciKeyboardService : InputMethodService() {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        reloadSkin()   // অ্যাপে সেটিং বদলালে সাথে সাথে কীবোর্ডে কাজ করবে
         learning = shouldLearn(info?.inputType ?: 0)
         suggestions = emptyList()
         if (!restarting) {
@@ -462,6 +485,7 @@ class SciKeyboardService : InputMethodService() {
     private fun go(p: Page) {
         page = p
         toolsOpen = false
+        settingsY = 0
         variantFor = null
         swipeAlt = null
         suggestions = emptyList()
@@ -492,6 +516,7 @@ class SciKeyboardService : InputMethodService() {
             Page.CLIP -> buildClip()
             Page.EDIT -> buildEdit()
             Page.NUMPAD -> buildNumpad()
+            Page.DIGITS -> buildDigits()
             Page.THEME -> buildThemePage()
         }
     }
@@ -928,7 +953,7 @@ class SciKeyboardService : InputMethodService() {
                 listOf(
                     key("Select all", 1f, Kind.KEY, 13f) { ic(android.R.id.selectAll) },
                     key("Cut", 1f, Kind.KEY, 13f) { ic(android.R.id.cut) },
-                    key("Copy", 1f, Kind.KEY, 13f) { ic(android.R.id.copy) },
+                    key("Copy", 1f, Kind.KEY, 13f) { copySelection() },
                     key("Paste", 1f, Kind.KEY, 13f) { ic(android.R.id.paste) }
                 )
             )
@@ -975,6 +1000,31 @@ class SciKeyboardService : InputMethodService() {
                     key("=", 1f) { typeKey("=") },
                     backspaceKey(1.2f),
                     enterKey(1.3f)
+                )
+            )
+        )
+    }
+
+    /** শুধু বড় ০–৯ সংখ্যার পেজ (টপ মেনুর "0-9" বাটন থেকে খোলে)। */
+    private fun buildDigits() {
+        fun tall(items: List<View>): LinearLayout =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(rowH() * 5 / 4)
+                )
+                items.forEach { addView(it) }
+            }
+        root.addView(tall("12345".map { c -> key(c.toString(), 1f, Kind.KEY, 32f) { typeKey(c.toString()) } }))
+        root.addView(tall("67890".map { c -> key(c.toString(), 1f, Kind.KEY, 32f) { typeKey(c.toString()) } }))
+        root.addView(
+            rowOf(
+                listOf(
+                    key("ABC", 1.5f, Kind.FUNC, 15f) { go(Page.LETTERS) },
+                    key("space", 3f, Kind.KEY, 13f, skin.hint) { pressSpace() },
+                    backspaceKey(1.5f),
+                    enterKey(1.5f)
                 )
             )
         )
@@ -1037,7 +1087,20 @@ class SciKeyboardService : InputMethodService() {
         // ---- টাইপিং
         col.addView(sectionLabel("Typing"))
         col.addView(toggleRow("✨", "Autocorrect", "Fix one-letter typos on space", prefs.autocorrect) { prefs.autocorrect = !prefs.autocorrect })
+        col.addView(toggleRow("🔊", "Volume keys move cursor", "Vol ▲ = left, Vol ▼ = right", prefs.volCursor) { prefs.volCursor = !prefs.volCursor })
         col.addView(toggleRow("👆", "Swipe typing", "Slide over letters to type a word", prefs.swipe) { prefs.swipe = !prefs.swipe })
+        val voiceChip = TextView(this).apply {
+            text = if (prefs.voiceLang == "bn-BD") "বাংলা" else "English"
+            setTextColor(skin.accent)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = font
+        }
+        col.addView(
+            settingRow("🎤", "Voice language", "Tap to switch. Long-press 🎤 works too", voiceChip) {
+                prefs.voiceLang = if (prefs.voiceLang == "bn-BD") "en-US" else "bn-BD"
+                render()
+            }
+        )
 
         // ---- আরও
         col.addView(sectionLabel("More"))
@@ -1048,7 +1111,10 @@ class SciKeyboardService : InputMethodService() {
             startActivity(i)
         })
 
-        root.addView(scrollArea(col))
+        val area = scrollArea(col) as ScrollView
+        area.setOnScrollChangeListener { _, _, y, _, _ -> settingsY = y }
+        area.post { area.scrollTo(0, settingsY) }
+        root.addView(area)
         root.addView(bottomBar())
     }
 
@@ -1289,9 +1355,11 @@ class SciKeyboardService : InputMethodService() {
         row.addView(toolbarMiddle())
         row.addView(fixedKey("⋯", toolsOpen) {
             toolsOpen = !toolsOpen
+            toolSel = -1
             fillStrip()
         })
-        row.addView(fixedKey("🎤", listening) { toggleVoice() })
+        val micLabel = if (prefs.voiceLang == "bn-BD" || page == Page.BANGLA) "🎤ব" else "🎤"
+        row.addView(fixedKey(micLabel, listening, onLong = { toggleVoiceLang() }) { toggleVoice() })
         return row
     }
 
@@ -1316,17 +1384,33 @@ class SciKeyboardService : InputMethodService() {
     private fun toolScroll(): View {
         val inner = LinearLayout(this)
         inner.orientation = LinearLayout.HORIZONTAL
-        inner.addView(fixedKey("☺", false) { go(Page.EMOJI) })
-        inner.addView(fixedKey("🖼", false) { go(Page.STICKER) })
-        inner.addView(fixedKey("বাং", false) { go(Page.BANGLA) })
-        inner.addView(fixedKey("📋", false) { go(Page.CLIP) })
-        inner.addView(fixedKey("✎", false) { go(Page.EDIT) })
-        inner.addView(fixedKey("123", false) { go(Page.NUMPAD) })
-        inner.addView(fixedKey("∑π", false) { go(Page.SYMBOLS) })
-        inner.addView(fixedKey("x²", script == Script.SUP) { toggleScript(Script.SUP) })
-        inner.addView(fixedKey("x₂", script == Script.SUB) { toggleScript(Script.SUB) })
-        inner.addView(fixedKey("◐", false) { go(Page.THEME) })
-        return hScroll(inner)
+        var n = 0
+        fun add(label: String, active: Boolean, action: () -> Unit) {
+            val idx = n++
+            inner.addView(fixedKey(label, active) {
+                toolSel = idx
+                action()
+            })
+        }
+        add("0-9", false) { go(Page.DIGITS) }
+        add("☺", false) { go(Page.EMOJI) }
+        add("🖼", false) { go(Page.STICKER) }
+        add("বাং", false) { go(Page.BANGLA) }
+        add("📋", false) { go(Page.CLIP) }
+        add("✎", false) { go(Page.EDIT) }
+        add("123", false) { go(Page.NUMPAD) }
+        add("∑π", false) { go(Page.SYMBOLS) }
+        add("x²", script == Script.SUP) { toggleScript(Script.SUP) }
+        add("x₂", script == Script.SUB) { toggleScript(Script.SUB) }
+        add("◐", false) { go(Page.THEME) }
+        val sv = hScroll(inner)
+        if (toolSel in 0 until n) frontScroll(sv, inner.getChildAt(toolSel))
+        return sv
+    }
+
+    /** [target] বাটনটা বারের একদম সামনে (বাঁয়ে) এনে দেখায়; পরের বাটনগুলো ক্রমানুসারে ওর পাশেই থাকে। */
+    private fun frontScroll(sv: HorizontalScrollView, target: View) {
+        sv.post { sv.scrollTo(maxOf(0, target.left - dp(4)), 0) }
     }
 
     private fun quickScroll(): View {
@@ -1338,7 +1422,7 @@ class SciKeyboardService : InputMethodService() {
         return hScroll(inner)
     }
 
-    private fun hScroll(inner: View): View =
+    private fun hScroll(inner: View): HorizontalScrollView =
         HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
@@ -1360,9 +1444,10 @@ class SciKeyboardService : InputMethodService() {
         label: String,
         active: Boolean,
         textColor: Int = skin.funcText,
+        onLong: (() -> Unit)? = null,
         onTap: () -> Unit
     ): View {
-        val v = key(label, 1f, if (active) Kind.ACCENT else Kind.FLAT, 20f, if (active) Color.WHITE else textColor, onTap = onTap)
+        val v = key(label, 1f, if (active) Kind.ACCENT else Kind.FLAT, 20f, if (active) Color.WHITE else textColor, onLong = onLong, onTap = onTap)
         v.layoutParams = LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT)
             .apply { setMargins(dp(1), dp(2), dp(1), dp(2)) }
         return v
@@ -1386,8 +1471,12 @@ class SciKeyboardService : InputMethodService() {
     private fun letterKeys(chars: String, hints: String, upper: Boolean): List<View> =
         chars.mapIndexed { i, ch ->
             val t = if (upper) ch.uppercaseChar().toString() else ch.toString()
-            val h = hints[i].toString()
-            val v = key(t, 1f, Kind.KEY, 22f, hint = h, onLong = { typeKey(h) }) { typeKey(t) }
+            val isPaste = ch == 'v'
+            val h = if (isPaste) "⎘" else hints[i].toString()
+            val v = key(
+                t, 1f, Kind.KEY, 25f, hint = h,
+                onLong = { if (isPaste) pasteClip() else typeKey(h) }
+            ) { typeKey(t) }
             v.tag = ch.lowercaseChar()
             v
         }
@@ -1554,7 +1643,7 @@ class SciKeyboardService : InputMethodService() {
             tab.setPadding(dp(12), 0, dp(12), 0)
             tabs.addView(tab)
         }
-        return HorizontalScrollView(this).apply {
+        val sv = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1562,6 +1651,9 @@ class SciKeyboardService : InputMethodService() {
             )
             addView(tabs)
         }
+        // নির্বাচিত ট্যাব বারের সামনে আসবে, বাকিগুলো ওর পরে ক্রমানুসারে
+        if (selected in 0 until tabs.childCount) frontScroll(sv, tabs.getChildAt(selected))
+        return sv
     }
 
     /** শিরোনামের সারি (বাঁয়ে নাম, ডানে ঐচ্ছিক বাটন)। */
@@ -1666,11 +1758,10 @@ class SciKeyboardService : InputMethodService() {
 
     // ---------------------------------------------------------------- voice typing
 
+    /** 🎤 চাপলে চালু; আবার 🎤 না চাপা পর্যন্ত (কথা থামলেও) নিজে থেকে শুনতে থাকে। */
     private fun toggleVoice() {
         if (listening) {
-            recognizer?.stopListening()
-            listening = false
-            fillStrip()
+            stopVoice()
             return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -1683,7 +1774,34 @@ class SciKeyboardService : InputMethodService() {
             toast("Voice typing is not available on this phone")
             return
         }
+        voiceFails = 0
+        listening = true
+        fillStrip()
         startVoice()
+    }
+
+    /** হাতে বন্ধ করা: শেষ বলা কথাটা বসে যাবে, তারপর আর শুনবে না। */
+    private fun stopVoice() {
+        listening = false
+        handler.removeCallbacks(voiceRestart)
+        try {
+            recognizer?.stopListening()
+        } catch (e: Throwable) {
+            // বন্ধ না হলেও সমস্যা নেই
+        }
+        fillStrip()
+    }
+
+    private fun scheduleVoiceRestart(delayMs: Long) {
+        handler.removeCallbacks(voiceRestart)
+        handler.postDelayed(voiceRestart, delayMs)
+    }
+
+    /** 🎤 চেপে ধরলে ভয়েসের ভাষা English ⇄ বাংলা। */
+    private fun toggleVoiceLang() {
+        prefs.voiceLang = if (prefs.voiceLang == "bn-BD") "en-US" else "bn-BD"
+        toast(if (prefs.voiceLang == "bn-BD") "Voice: বাংলা" else "Voice: English")
+        fillStrip()
     }
 
     private fun startVoice() {
@@ -1698,25 +1816,44 @@ class SciKeyboardService : InputMethodService() {
             override fun onPartialResults(partialResults: Bundle?) {}
 
             override fun onError(error: Int) {
-                listening = false
-                fillStrip()
-                if (error != SpeechRecognizer.ERROR_NO_MATCH &&
-                    error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT &&
-                    error != SpeechRecognizer.ERROR_CLIENT
-                ) {
-                    toast("Voice typing error ($error)")
+                if (!listening) {
+                    fillStrip()
+                    return
+                }
+                when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH,
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                        voiceFails = 0
+                        scheduleVoiceRestart(250)
+                    }
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+                    SpeechRecognizer.ERROR_CLIENT -> {
+                        voiceFails++
+                        if (voiceFails > 4) {
+                            listening = false
+                            fillStrip()
+                            toast("Voice typing stopped")
+                        } else {
+                            scheduleVoiceRestart(600)
+                        }
+                    }
+                    else -> {
+                        listening = false
+                        fillStrip()
+                        toast("Voice typing error ($error)")
+                    }
                 }
             }
 
             override fun onResults(results: Bundle?) {
-                listening = false
                 val text = results
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()
                 if (!text.isNullOrBlank()) {
                     currentInputConnection?.commitText("$text ", 1)
                 }
-                fillStrip()
+                voiceFails = 0
+                if (listening) scheduleVoiceRestart(150) else fillStrip()
                 updateSuggestions()
             }
         })
@@ -1724,10 +1861,16 @@ class SciKeyboardService : InputMethodService() {
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (page == Page.BANGLA) "bn-BD" else prefs.voiceLang)
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-        listening = true
-        fillStrip()
-        r.startListening(i)
+        try {
+            r.startListening(i)
+        } catch (e: Throwable) {
+            listening = false
+            fillStrip()
+            toast("Voice typing error")
+        }
     }
 
     // ---------------------------------------------------------------- clipboard
@@ -1743,6 +1886,29 @@ class SciKeyboardService : InputMethodService() {
             while (clips.size > 20) clips.removeAt(clips.size - 1)
         } catch (e: Exception) {
             // ক্লিপবোর্ড পড়া না গেলে চুপচাপ বাদ দিই
+        }
+    }
+
+    /** `v` চেপে ধরলে: সবশেষ কপি করা লেখা বসে যায়। */
+    private fun pasteClip() {
+        val text = try {
+            val clip = clipboard?.primaryClip
+            if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this)?.toString() else null
+        } catch (e: Exception) {
+            null
+        }
+        if (text.isNullOrEmpty()) toast("Clipboard is empty") else commit(text)
+    }
+
+    /** Copy: নির্বাচন/কার্সর যেখানে ছিল সেখানেই থাকে (সিস্টেমের copy অনেক জায়গায় কার্সর শুরুতে নিয়ে যায়)। */
+    private fun copySelection() {
+        val ic = currentInputConnection ?: return
+        val sel = ic.getSelectedText(0)
+        if (!sel.isNullOrEmpty()) {
+            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("text", sel))
+            toast("Copied")
+        } else {
+            ic.performContextMenuAction(android.R.id.copy)
         }
     }
 
@@ -2069,10 +2235,38 @@ class SciKeyboardService : InputMethodService() {
 
     private fun pressKeyCode(code: Int) {
         val ic = currentInputConnection ?: return
-        val meta = if (selectMode) KeyEvent.META_SHIFT_ON else 0
         val now = SystemClock.uptimeMillis()
-        ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, meta))
-        ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, meta))
+        if (selectMode) {
+            // আসল Shift চাপার মতো: Shift ↓, তীর ↓↑, Shift ↑ — তাই মার্ক করা অংশ বাড়ে, কার্সর শুরুতে ফেরে না
+            val m = KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT, 0, m))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, m))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, m))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
+        } else {
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, 0))
+            ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, 0))
+        }
+    }
+
+    // ভলিউম বাটন = কার্সর সরানো (কীবোর্ড খোলা থাকলে): Vol ▲ বাঁয়ে, Vol ▼ ডানে
+    private fun isVolumeKey(code: Int) =
+        code == KeyEvent.KEYCODE_VOLUME_UP || code == KeyEvent.KEYCODE_VOLUME_DOWN
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isVolumeKey(keyCode) && ::prefs.isInitialized && prefs.volCursor && isInputViewShown) {
+            pressKeyCode(
+                if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) KeyEvent.KEYCODE_DPAD_LEFT
+                else KeyEvent.KEYCODE_DPAD_RIGHT
+            )
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isVolumeKey(keyCode) && ::prefs.isInitialized && prefs.volCursor && isInputViewShown) return true
+        return super.onKeyUp(keyCode, event)
     }
 
     private fun backspace() {
@@ -2119,6 +2313,9 @@ class SciKeyboardService : InputMethodService() {
         const val ROW_H = 52      // dp: প্রতিটি সারির উচ্চতা (মার্জিনসহ)
         const val STRIP_H = 42    // dp: উপরের টুলবার
         const val COLS = 8        // সিম্বল/ইমোজি পেজের কলাম
+
+        /** এই সেটিংগুলো বদলালে কীবোর্ড তখনই নতুন করে সাজে (ইমোজি ইতিহাস ইত্যাদিতে নয়)। */
+        val LIVE_KEYS = setOf("theme", "font", "bg_rev", "height_pct", "voice_lang")
 
         val QUICK = listOf(
             "π", "√", "∑", "∫", "±", "×", "÷", "≤", "≥", "≠", "≈", "∞", "°",
